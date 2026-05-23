@@ -15,7 +15,6 @@
 #define MISO1 PA6 //yellow
 #define SCLK1 PA5 //red
 #define CS1 PA4 //white
-#define IMU_CS PB12
 
 #define USART_TX_Pin GPIO_PIN_2
 #define USART_RX_Pin GPIO_PIN_3
@@ -89,6 +88,7 @@ extern "C" void MX_USART2_UART_Init(void)
   huart2.Init.Mode = UART_MODE_TX_RX;
   huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
   huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  
   if (HAL_UART_Init(&huart2) != HAL_OK)
   {
     Error_Handler();
@@ -103,10 +103,18 @@ extern "C" void HAL_UART_MspInit(UART_HandleTypeDef* huart)
     __HAL_RCC_USART2_CLK_ENABLE();
     __HAL_RCC_GPIOA_CLK_ENABLE();
 
-    GPIO_InitStruct.Pin = USART_TX_Pin|USART_RX_Pin;
+// 1. Force PA3 (or your defined TX) to be the Transmitter
+    GPIO_InitStruct.Pin = USART_TX_Pin; 
     GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF7_USART2;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    // 2. Force PA2 (or your defined RX) to be the Receiver
+    GPIO_InitStruct.Pin = USART_RX_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP; // RX should still be AF_PP for UART
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
     GPIO_InitStruct.Alternate = GPIO_AF7_USART2;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
@@ -173,31 +181,14 @@ BLDCMotor motor = BLDCMotor(11);
 BLDCDriver3PWM driver = BLDCDriver3PWM(PA8, PA9, PA10, PC9);
 
 float target_angle = 0;
-volatile float derivative = 0;
-volatile float imu_angle_z = 0;  // shared between ISR and main loop
-volatile float imu_angle_y = 0;
-volatile float filtered_imu_angle_z = 0;  // filtered IMU value
-const float alpha = 0.9;  // Low-pass filter coefficient (0.1 for smoothing)
 
-// PID gains
-const float pid_Kp = 0.025;
-const float pid_Ki = 12;
-const float pid_Kd = 0.0;
-
-// PID state
-volatile float pid_output = 0;
-volatile float pid_integral = 0;
-volatile float last_error = 0;
-volatile float rate_error = 0;
 static float tx_value = 0.0f;
+
+volatile float temp_velocity = 0.0f;
 
 static uint8_t tx_buf[5];
 
 Commander command = Commander(Serial);
-
-SPIClass SPI_2(PB15, PB14, PB13); // MOSI, MISO, SCK
-ICM_20948_SPI myimu;
-SPISettings imuSPISettings(7000000, MSBFIRST, SPI_MODE3);
 
 void doTarget(char* cmd) { command.scalar(&target_angle, cmd); }
 void doMotor(char* cmd) { command.motor(&motor, cmd); }
@@ -207,24 +198,10 @@ void setup() {
   SystemClock_Config();
   MX_DMA_Init();
   MX_USART2_UART_Init();
- 
+
   Serial.begin(115200);
 
   HAL_NVIC_SetPriority(OTG_FS_IRQn, 0, 0);
-
-  SPI_2.begin();
-
-  ICM_20948_fss_t fs;   // full scale settings struct
-  fs.a = gpm2;          // accelerometer +-2g
-  fs.g = dps2000;       // gyroscope +-2000 deg/s
-
-  if (myimu.begin(IMU_CS, SPI_2) != ICM_20948_Stat_Ok) {
-    Serial.println("IMU init failed!");
-    while (1) {}
-  }
-
-  myimu.setFullScale((ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr), fs);
-  Serial.println("IMU initialized successfully");
 
   motor.useMonitoring(Serial);
 
@@ -244,7 +221,7 @@ void setup() {
   motor.torque_controller = TorqueControlType::voltage;
 
   motor.monitor_variables = _MON_TARGET | _MON_VOLT_Q | _MON_VEL;
-  motor.monitor_downsample = 1000;
+  motor.monitor_downsample = 100000;
 
   motor.init();
   motor.initFOC();
@@ -258,68 +235,44 @@ void setup() {
   timer->setOverflow(10000, HERTZ_FORMAT); 
   timer->attachInterrupt([&](){
 
-    rate_error = target_angle - imu_angle_z;
-
-    if (fabs(rate_error) < 6.0) {
-        rate_error = 0.0;  // Ignore small errors within the deadband range
-    }
-
-    pid_integral += rate_error * 0.0001;
-
-        if (pid_integral > 10.0) {
-        pid_integral = 10.0;  // Limit the integral term
-    } else if (pid_integral < -10.0) {
-        pid_integral = -10.0;  // Limit the integral term
-    }
-
-    derivative = (rate_error - last_error) / 0.0001;
-    pid_output = (pid_Kp*rate_error) + (pid_Ki*pid_integral) + (pid_Kd*derivative);
-
-    // Limit the target_angle between -2 and 2
-    if (pid_output > 3.5) {
-        pid_output = 3.5;
-    } else if (pid_output < -3.5) {
-        pid_output = -3.5;
-    }
-    
+    temp_velocity = sensor.getVelocity();
     motor.loopFOC();
-    motor.move(pid_output);
-    last_error = rate_error;
+    motor.move(target_angle);
+
   });
 
   timer->resume();
   HAL_NVIC_SetPriority(TIM5_IRQn, 1, 0);
 
-  HardwareTimer* imuTimer = new HardwareTimer(TIM4); // Use TIM4 for IMU
-  imuTimer->setOverflow(1200, HERTZ_FORMAT);
-  imuTimer->attachInterrupt([]() {
-      if (myimu.dataReady()) {
-          myimu.getAGMT();             // read accel, gyro, mag, temp
-          imu_angle_z = myimu.gyrZ();  // store Z gyro value in volatile
-          imu_angle_y = myimu.gyrY();
-      }
+  HardwareTimer* timer2 = new HardwareTimer(TIM2);
+  timer2->setOverflow(500, HERTZ_FORMAT); 
+  timer2->attachInterrupt([&](){
+
+    if (dma_tx_complete && huart2.gState == HAL_UART_STATE_READY)
+    {
+      __disable_irq();
+      tx_value = temp_velocity;
+      __enable_irq();
+
+      tx_buf[0] = 0xAB; // sync byte
+      memcpy(&tx_buf[1], &tx_value, 4);
+      HAL_UART_Transmit_DMA(&huart2, tx_buf, 5);
+      dma_tx_complete = false;
+
+    }
+
   });
-  imuTimer->resume();
-  HAL_NVIC_SetPriority(TIM4_IRQn, 3, 0);
-  
+
+  timer2->resume();
+  HAL_NVIC_SetPriority(TIM2_IRQn, 3, 0);
+
   _delay(1000);
 
 }
 
 void loop() {
 
-
-  if (dma_tx_complete && huart2.gState == HAL_UART_STATE_READY)
-  {
-    tx_value = imu_angle_y;
-    tx_buf[0] = 0xAB; // sync byte
-    memcpy(&tx_buf[1], &tx_value, 4);
-    HAL_UART_Transmit_DMA(&huart2, tx_buf, 5);
-    dma_tx_complete = false;
-
-  }
-
-  // motor.monitor();
-  // command.run(); 
+  motor.monitor();
+  command.run(); 
 
 }
