@@ -75,8 +75,8 @@
 
   //gains
   const float alpha = 0.9;
-  const float pid_Kp = 0.025;
-  const float pid_Ki = 0.04;
+  const float pid_Kp = 0.03;
+  const float pid_Ki = 0.03;
   const float pid_Kd = 0.000;
 
   //control variables
@@ -150,6 +150,7 @@
       motor.voltage_limit = 0;  // when no lock
       pid_integral = 0.0f;
       last_error = 0.0f;
+      v_ff = 0.0f;
 
       motor.move(0);
     }
@@ -159,6 +160,7 @@
       motor.voltage_limit = 0;  // when no lock
       pid_integral = 0.0f;
       last_error = 0.0f;
+      v_ff = 0.0f;
 
       motor.move(0);
     } 
@@ -186,8 +188,10 @@
       pid_output = (pid_Kp * error) + (pid_Ki * pid_integral) + (pid_Kd * derivative);
       last_error = error;
 
-      if (pid_output > 3.0f) pid_output = 3.0f;
-      if (pid_output < -3.0f) pid_output = -3.0f;
+      pid_output = pid_output + (v_ff * 0.000f);
+
+      if (pid_output > 4.0f) pid_output = 4.0f;
+      if (pid_output < -4.0f) pid_output = -4.0f;
 
       motor.move(pid_output);
     }
