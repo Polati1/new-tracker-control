@@ -1,10 +1,10 @@
 import cv2
 import numpy as np
-from threading import Thread
-from pypylon import pylon
 import time
 import serial
 import struct
+from pypylon import pylon
+from threading import Thread, Event, Lock
 import ctypes
 
 try:
@@ -13,71 +13,140 @@ try:
 except Exception as e:
     print(f"Timer fix failed: {e}")
 
-last_time = time.time()
 alive = True
-new_bbox = None
-reset_bbox = False
-video_width = 900
-video_height = 900
-actual_w = 900
-actual_h = 900
-seeker_size = 300
-tracker_radius = 75
-seek_radius = 150
-display_width = 300
-midx = actual_w // 2
-midy = actual_h // 2
+prev_blob = None
 prev_h_error = 0
 prev_y_error = 0
 vx_filt = 0.0
 vy_filt = 0.0
-lpf_alpha = 0.91
-text_x = 30
-timer = 0
-last_lock_time = 0
-lock_active = False
-first_lock = True
-tracker = None
-frame_global = None
 
-def drawRectangle(frame, bbox):
-    x, y, w, h = map(int, bbox)
-    cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 0, 0), 2)
-    cv2.circle(frame, (x + w//2, y + h//2), 3, (0, 0, 255), -1)
+shared_h_error = 999.0
+shared_y_error = 999.0
+shared_vx = 0.0
+shared_vy = 0.0
+
+TEXT_X = 30
+MAX_JUMP = 100
+TRACKER_RADIUS = 25
+LPF_ALPHA = 0.98
+
+CAMERA_ROI_SIZE = 900
+CAMERA_CENTER_X = CAMERA_ROI_SIZE // 2
+CAMERA_CENTER_Y = CAMERA_ROI_SIZE // 2
+
+ROI_SIZE = 500 
+ROI_X1 = (CAMERA_ROI_SIZE - ROI_SIZE) // 2 
+ROI_Y1 = (CAMERA_ROI_SIZE - ROI_SIZE) // 2 
+ROI_X2 = ROI_X1 + ROI_SIZE 
+ROI_Y2 = ROI_Y1 + ROI_SIZE
+
+BLOB_ROI_SIZE = 250
+#array of zeros for the flood mask
+flood = np.zeros((BLOB_ROI_SIZE + 2, BLOB_ROI_SIZE + 2), np.uint8)
+
+BRIGHTNESS_THRESHOLD = 245
+CENTROID_THRESHOLD = 235
+
+PITCH_MOTOR_SER = 'COM9'
+YAW_MOTOR_SER = 'COM14'
+LOOPBACK = 'loop://'
+
+def safe_serial(port):
+    try:
+        return serial.Serial(port=port, baudrate=115200, timeout=0)
+    except Exception:
+        return None
+
+sery = safe_serial(PITCH_MOTOR_SER)
+serx = safe_serial(YAW_MOTOR_SER)
+
+bufy = bytearray(9)
+bufx = bytearray(9)
+
+bufy[0] = 0xAA
+bufx[0] = 0xAA
+
+lock = Lock()
+
+
+def serial_thread():
+
+    global shared_h_error, shared_y_error, shared_vx, shared_vy
+
+    while True:
+
+        lock.acquire()
+
+        struct.pack_into('<f', bufy, 1, shared_y_error)
+        struct.pack_into('<f', bufy, 5, shared_vy)
+
+        struct.pack_into('<f', bufx, 1, shared_h_error)
+        struct.pack_into('<f', bufx, 5, shared_vx)
+
+        lock.release()
+
+        sery.write(bufy)
+        serx.write(bufx)
+
+Thread(target=serial_thread, daemon=True).start()
+
+def safe_serial(port):
+    try:
+        return serial.Serial(port=port, baudrate=115200, timeout=0)
+    except Exception:
+        return None
+
+def drawTrackBox(frame, bbox):
+    x, y, w, h = bbox
+    cv2.rectangle(frame, (x, y), (x+w, y+h), (0), 2)
+    cv2.rectangle(frame, (x, y), (x+w, y+h), (255), 1)
+    cv2.circle(frame, (x + w//2, y + h//2), 3, (255), -1)
+
+def drawTrackLine(frame, bbox):
+    x, y, w, h = bbox
+    cv2.line(frame, (0, y + h//2), (CAMERA_ROI_SIZE, y + h//2), (0), 2)
+    cv2.line(frame, (x + w//2, 0), (x + w//2, CAMERA_ROI_SIZE), (0), 2)
+    cv2.line(frame, (0, y + h//2), (CAMERA_ROI_SIZE, y + h//2), (255), 1)
+    cv2.line(frame, (x + w//2, 0), (x + w//2, CAMERA_ROI_SIZE), (255), 1)
 
 def drawCircle(frame, coord):
-    cv2.circle(frame, (int(coord[0]), int(coord[1])), 2, (0, 255, 0), 1)
+    cv2.circle(frame, (int(coord[0]), int(coord[1])), 10, (255), 1, cv2.LINE_AA)
 
-def drawText(frame, txt, location, color=(50, 170, 50)):
-    cv2.putText(frame, txt, location, cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
+def drawText(frame, txt, location):
+    cv2.putText(frame, txt, location, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255), 1)
 
-def draw_new_bbox(event, x, y, flags, param):
-    global new_bbox, reset_bbox, lock_active, last_lock_time, tracker, frame_global, first_lock
-    global prev_h_error, prev_y_error, vx_filt, vy_filt
+def find_bright_centroid(frame):
 
-    if event == cv2.EVENT_LBUTTONDOWN:
+    _, maxVal, _, maxLoc = cv2.minMaxLoc(frame[ROI_Y1:ROI_Y2, ROI_X1:ROI_X2]) #find brightest pixel val and location in x,y coords
+    if maxVal < BRIGHTNESS_THRESHOLD: #immediately return None for pixel array and None for location
+        return None, None
+    fx = maxLoc[0] + ROI_X1
+    fy = maxLoc[1] + ROI_Y1
+    #find bounding box for blob region around brightest pixel, ensuring it stays within the ROI bounds
+    x1 = max(fx - (BLOB_ROI_SIZE//2), 0) #find left edge of box, ensuring it doesn't go below 0
+    y1 = max(fy - (BLOB_ROI_SIZE//2), 0) #find top edge of box, ensuring it doesn't go below 0
+    x2 = min(fx + (BLOB_ROI_SIZE//2), CAMERA_ROI_SIZE) #find right edge of box, ensuring it doesn't go above ROI size
+    y2 = min(fy + (BLOB_ROI_SIZE//2), CAMERA_ROI_SIZE) #find bottom edge of box, ensuring it doesn't go above ROI size
 
-        box_size = tracker_radius
-        x0 = max(x - box_size, 0)
-        y0 = max(y - box_size, 0)
-        w = h = box_size * 2
+    #get tracking roi array
+    crop = frame[y1:y2, x1:x2] 
+    crop_loc = (fx - x1, fy - y1) #get maxLoc coordinates in tracking roi coords
 
-        new_bbox = (x0, y0, w, h)
-        reset_bbox = True
+    #mask is a binary image where everything above threshold is 255, else 0
+    _, mask = cv2.threshold(crop, CENTROID_THRESHOLD, 255, cv2.THRESH_BINARY)
 
-        tracker = cv2.legacy.TrackerMOSSE.create()
-        if frame_global is not None:
-            tracker.init(frame_global, new_bbox)
-            
-            x_new, y_new, w_new, h_new = new_bbox
-            prev_h_error = (x_new + w_new//2) - (actual_w // 2)
-            prev_y_error = -((y_new + h_new//2) - (actual_h // 2))
-            vx_filt = 0.0
-            vy_filt = 0.0
+    flood[:] = 0 #clear the flood mask (allocate all 0s)
+    flood_view = flood[:mask.shape[0]+2, :mask.shape[1]+2]     #bound it the tracking mask goes near the edges near the edges
 
-        lock_active = True
-        first_lock = True
-        last_lock_time = time.time()
+    cv2.floodFill(mask, flood_view, crop_loc, 128) #starting from cropLoc, fill everything connected with 128. one single 128 blob
+    spot_mask = (mask == 128).astype(np.uint8) #remove everything which remains as not 128
+    weighted = (crop * spot_mask).astype(np.float32) #multiply original intensity with mask for weighted sum
+    M = cv2.moments(weighted) #find moments of the remaining blob to find centroid location
+    if M["m00"] > 0:
+        cx = int(M["m10"] / M["m00"]) + x1 #back into frame coords
+        cy = int(M["m01"] / M["m00"]) + y1 #back into frame coords
+        return (cx, cy), spot_mask * 255 #return tracking coords and mask array
+    return None, None
 
 class BaslerVideoCaptureAsync:
     def __init__(self, width, height):
@@ -88,6 +157,7 @@ class BaslerVideoCaptureAsync:
         self.running = False
         self.grabbed = False
         self.frame = None
+        self.frame_ready = Event()
 
     def start(self):
         self.running = True
@@ -102,18 +172,20 @@ class BaslerVideoCaptureAsync:
             res = self.camera.RetrieveResult(200)
             if res.GrabSucceeded():
                 img = res.Array
-                if len(img.shape) == 2:
-                    img = cv2.cvtColor(img, cv2.COLOR_BAYER_BG2BGR)
                 self.frame = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+                self.frame_ready.set()
             res.Release()
 
     def read(self):
-        if self.frame is not None:
-            return True, self.frame
-        return False, None
+        self.frame_ready.wait()
+        self.frame_ready.clear()
+        f = self.frame
+        self.frame = None
+        return f
 
     def stop(self):
         self.running = False
+        self.frame_ready.set()
         self.thread.join()
         self.camera.StopGrabbing()
         self.camera.Close()
@@ -121,76 +193,60 @@ class BaslerVideoCaptureAsync:
 
 def start_opencv_thread():
 
-    global alive, reset_bbox, new_bbox, fps_smooth, last_time, midx, midy, frame_global, lock_active, tracker, text_x, prev_h_error, prev_y_error, vx_filt, vy_filt, first_lock
+    global alive, prev_blob, prev_h_error, prev_y_error, vx_filt, vy_filt
+    global shared_h_error, shared_y_error, shared_vx, shared_vy
 
-    video = BaslerVideoCaptureAsync(video_width, video_height).start()
+    video = BaslerVideoCaptureAsync(CAMERA_ROI_SIZE, CAMERA_ROI_SIZE).start()
     cv2.namedWindow("Camera/Tracker View", cv2.WINDOW_NORMAL)
-    cv2.setMouseCallback("Camera/Tracker View", draw_new_bbox)
-
-    # y or pitch motor serial
-    sery = serial.Serial(port='COM9', baudrate=115200, timeout=0)
-    bufy = bytearray(9)
-    bufy[0] = 0xAA
-
-    # x or yaw motor serial
-    serx = serial.Serial(port='COM1', baudrate=115200, timeout=0)
-    bufx = bytearray(9)
-    bufx[0] = 0xAA
-
-    _, frame = video.read()
-    bbox = (0, 0, 0, 0)
 
     prev_time = time.perf_counter()
-  
+
     while alive:
 
-        ret, frame = video.read()
-        if not ret: continue
+        frame = video.read()
 
-        frame_global = frame.copy()
+        valid, roi_vis = find_bright_centroid(frame)
 
-        if lock_active and tracker is not None:
-            ok, bbox = tracker.update(frame)
-        else:
-            ok = False
+        if (valid is not None):
 
-        seeker_view = None
+            roi_cx, roi_cy = valid
+            candidate_x = roi_cx
+            candidate_y = roi_cy
 
-        if ok:
+            if prev_blob is None:
+                blob_x, blob_y = candidate_x, candidate_y
+                prev_blob = (blob_x, blob_y)
 
-            drawRectangle(frame, bbox)
-            x, y, w, h = map(int, bbox)
-            midx = x + w//2
-            midy = y + h//2
+            else:
+                px, py = prev_blob
+                dx = candidate_x - px
+                dy = candidate_y - py
 
-            h_error = (int(bbox[0] + bbox[2]//2)) - (actual_w // 2)
-            y_error = -((int(bbox[1] + bbox[3]//2)) - (actual_h // 2))
-
-            y1 = max(0, midy - seek_radius)
-            y2 = min(actual_h, midy + seek_radius)
-            x1 = max(0, midx - seek_radius)
-            x2 = min(actual_w, midx + seek_radius)
-            seeker_view = frame[y1:y2, x1:x2]
-
-            cv2.line(frame, (0, midy), (actual_w, midy), (0, 0, 255), 1)
-            cv2.line(frame, (midx, 0), (midx, actual_h), (0, 0, 255), 1)
+                if (dx*dx + dy*dy) <= (MAX_JUMP * MAX_JUMP):
+                    blob_x, blob_y = candidate_x, candidate_y
+                else:
+                    blob_x, blob_y = px, py
 
         else:
 
-            if lock_active:
-                lock_active = False
-                tracker = None
+            roi_vis = np.zeros((BLOB_ROI_SIZE, BLOB_ROI_SIZE), np.uint8)
+            blob_x, blob_y = CAMERA_CENTER_X, CAMERA_CENTER_Y
 
-            first_lock = True
-            midx, midy = actual_w//2, actual_h//2
-            drawText(frame, "NO LOCK", (text_x, 30), (0, 0, 255))
+        prev_blob = (blob_x, blob_y)
 
-            h_error = 999.0
-            y_error = 999.0
-            vx_filt = 0.0  
-            vy_filt = 0.0
-            vx = 0.0
-            vy = 0.0
+        x = max(blob_x - TRACKER_RADIUS, 0)
+        y = max(blob_y - TRACKER_RADIUS, 0)
+        w = min(TRACKER_RADIUS * 2, CAMERA_ROI_SIZE - x)
+        h = min(TRACKER_RADIUS * 2, CAMERA_ROI_SIZE - y)
+
+
+        bbox = (x, y, w, h)
+
+        midx = x + w//2
+        midy = y + h//2
+
+        h_error = midx - CAMERA_CENTER_X
+        y_error = CAMERA_CENTER_Y - midy
 
         curr_time = time.perf_counter()
         dt = curr_time - prev_time
@@ -199,12 +255,11 @@ def start_opencv_thread():
 
             fps = 1.0 / dt
 
-            # Normal velocity calculation
             vx = (h_error - prev_h_error) / dt
             vy = (y_error - prev_y_error) / dt
             
-            vx_filt = lpf_alpha * vx_filt + (1 - lpf_alpha) * vx
-            vy_filt = lpf_alpha * vy_filt + (1 - lpf_alpha) * vy
+            vx_filt = LPF_ALPHA * vx_filt + (1 - LPF_ALPHA) * vx
+            vy_filt = LPF_ALPHA * vy_filt + (1 - LPF_ALPHA) * vy
 
         else:
 
@@ -212,45 +267,38 @@ def start_opencv_thread():
             vx = 0
             vy = 0
 
-        if not ok:
-
-            struct.pack_into('<f', bufy, 1, 999.0)
-            struct.pack_into('<f', bufy, 5, 0.0)
-            sery.write(bufy)
-
-            struct.pack_into('<f', bufx, 1, 999.0)
-            struct.pack_into('<f', bufx, 5, 0.0)
-            serx.write(bufx)
-
-        else:
-
-            struct.pack_into('<f', bufy, 1, y_error)
-            struct.pack_into('<f', bufy, 5, vy_filt)
-            sery.write(bufy)
-
-            struct.pack_into('<f', bufx, 1, h_error)
-            struct.pack_into('<f', bufx, 5, vx_filt)
-            serx.write(bufx)
-
         prev_time = curr_time
         prev_h_error = h_error
         prev_y_error = y_error
 
-        if seeker_view is not None and seeker_view.size > 0:
-            inset = cv2.resize(seeker_view, (display_width, display_width), interpolation=cv2.INTER_NEAREST)
-            y_start, x_start = actual_h - 300, actual_w - 300
-            frame[y_start:y_start+300, x_start:x_start+300] = inset
-            cv2.rectangle(frame, (x_start, y_start), (x_start+300, y_start+300), (0, 255, 255), 2)
+        lock.acquire()
+        if (valid is not None and not (h_error == 0 and y_error == 0)):
+            shared_h_error = h_error
+            shared_y_error = y_error
+            shared_vx = vx_filt
+            shared_vy = vy_filt
+        else:
+            shared_h_error = 999
+            shared_y_error = 999
+            shared_vx = 0
+            shared_vy = 0
+        lock.release()
 
-        drawText(frame, f"FPS: {fps:.1f}", (text_x, 60))
-        drawText(frame, f"Co-ords: {int(midx)}, {int(midy)}", (text_x, 90))
-        drawText(frame, f"Horz. Error: {h_error}", (text_x, 120))
-        drawText(frame, f"Vert. Error: {y_error}", (text_x, 150))
-        drawText(frame, f"Vx: {vx_filt:.1f}", (text_x, 180))
-        drawText(frame, f"Vy: {vy_filt:.1f}", (text_x, 210))
-        drawCircle(frame, (actual_w//2, actual_h//2))
+
+        drawTrackBox(frame, bbox)
+        drawTrackLine(frame, bbox)
+        drawCircle(frame, (CAMERA_CENTER_X, CAMERA_CENTER_Y))
+        drawText(frame, f"FPS: {int(fps)}", (TEXT_X, 60))
+        drawText(frame, f"Co-ords: {midx}, {midy}", (TEXT_X, 90))
+        drawText(frame, f"Horz. Error: {h_error}", (TEXT_X, 120))
+        drawText(frame, f"Vert. Error: {y_error}", (TEXT_X, 150))
+        drawText(frame, f"Vx: {int(vx_filt)}", (TEXT_X, 180))
+        drawText(frame, f"Vy: {int(vy_filt)}", (TEXT_X, 210))
+
+        print(f"Co-ords: {midx}, {midy} FPS: {int(fps)}")
 
         cv2.imshow("Camera/Tracker View", frame)
+        cv2.imshow("ROI Process View", roi_vis)
 
         if cv2.waitKey(1) == 27:
             alive = False
@@ -260,3 +308,4 @@ def start_opencv_thread():
 
 if __name__ == "__main__":
     start_opencv_thread()
+    
